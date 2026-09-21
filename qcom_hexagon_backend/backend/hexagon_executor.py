@@ -9,6 +9,7 @@
 
 import os, subprocess, struct, sys, shutil
 import time
+from pathlib import Path
 import torch
 import numpy as np
 from collections import namedtuple
@@ -40,12 +41,81 @@ def _sdk_tool_version(q6_version: str) -> str:
 def _qhmath_sdk_path(q6_version: str) -> tuple:
     """Tool/arch version for qhmath_hvx prebuilt libs.
 
-    v79 qhmath_hvx in SDK <= 6.4.0.0 is missing fp16 _ahf symbols;
-    fall back to v75 toolv87 libs until HSDK 6.6.0.
+    V81 has native toolv19_v81 QHL math libraries. V79-v80 retain the
+    compatibility fallback to v75 toolv87 libraries for older SDKs.
     """
-    if int(q6_version.lstrip("v")) >= 79:
+    version = int(q6_version.lstrip("v"))
+    if version >= 81:
+        return ("v19", q6_version)
+    if version >= 79:
         return ("v87", "75")
     return (_sdk_tool_version(q6_version), q6_version)
+
+
+def _qhmath_hvx_library_dir(hexagon_sdk_root: str, q6_version: str) -> str:
+    """Find a QHL HVX library directory for the requested architecture."""
+    tool_version, arch_version = _qhmath_sdk_path(q6_version)
+    relative_dir = os.path.join(
+        "libs",
+        "qhl_hvx",
+        "prebuilt",
+        f"hexagon_tool{tool_version}_v{arch_version}",
+    )
+    sdk_roots = [hexagon_sdk_root]
+    sdk_parent = os.path.dirname(os.path.abspath(hexagon_sdk_root))
+    try:
+        sibling_roots = [
+            os.path.join(sdk_parent, entry)
+            for entry in os.listdir(sdk_parent)
+            if os.path.isdir(os.path.join(sdk_parent, entry))
+            and all(part.isdigit() for part in entry.split("."))
+        ]
+    except OSError:
+        sibling_roots = []
+    sibling_roots.sort(
+        key=lambda path: tuple(int(part) for part in os.path.basename(path).split(".")),
+        reverse=True,
+    )
+    sdk_roots.extend(root for root in sibling_roots if root != hexagon_sdk_root)
+
+    for sdk_root in sdk_roots:
+        candidate = os.path.join(sdk_root, relative_dir)
+        if os.path.exists(os.path.join(candidate, "libqhmath_hvx.a")):
+            return candidate
+    return os.path.join(hexagon_sdk_root, relative_dir)
+
+
+def _hexkl_library_dir(hexkl_root: str, q6_version: str) -> Optional[str]:
+    """Find the HexKL libraries for a Hexagon architecture version."""
+    lib_root = os.path.join(hexkl_root, "lib")
+    tool_dir = f"hexagon_toolv19_v{q6_version}"
+    versioned_roots = []
+    try:
+        versioned_roots = [
+            os.path.join(lib_root, entry)
+            for entry in os.listdir(lib_root)
+            if os.path.isdir(os.path.join(lib_root, entry))
+            and all(part.isdigit() for part in entry.split("."))
+        ]
+    except OSError:
+        pass
+
+    versioned_roots.sort(
+        key=lambda path: tuple(int(part) for part in os.path.basename(path).split(".")),
+        reverse=True,
+    )
+    candidates = [
+        os.path.join(versioned_root, tool_dir) for versioned_root in versioned_roots
+    ]
+    candidates.append(os.path.join(lib_root, tool_dir))
+
+    for candidate in candidates:
+        if all(
+            os.path.exists(os.path.join(candidate, library))
+            for library in ("libhexkl_micro.a", "libhexkl_macro.a")
+        ):
+            return candidate
+    return None
 
 
 # This file is part of a small subset of python files that uses some type-annotations
@@ -260,13 +330,11 @@ class HexagonExecutor:
             HEXAGON_SDK_ROOT=self.config.env_vars["HEXAGON_SDK_ROOT"],
             Q6_VERSION=self.config.Q6_VERSION,
         )
-        qhmath_tool_ver, qhmath_arch_ver = _qhmath_sdk_path(self.config.Q6_VERSION)
-        QHL_LINK_DIR = "{HEXAGON_SDK_ROOT}/libs/qhl_hvx/prebuilt/hexagon_tool{TOOL_VERSION}_v{Q6_VERSION}".format(
-            HEXAGON_SDK_ROOT=self.config.env_vars["HEXAGON_SDK_ROOT"],
-            TOOL_VERSION=qhmath_tool_ver,
-            Q6_VERSION=qhmath_arch_ver,
+        QHL_LINK_DIR = _qhmath_hvx_library_dir(
+            self.config.env_vars["HEXAGON_SDK_ROOT"], self.config.Q6_VERSION
         )
 
+        qhmath_tool_ver, qhmath_arch_ver = _qhmath_sdk_path(self.config.Q6_VERSION)
         if not (
             os.path.exists(QHL_LINK_DIR)
             and os.path.exists(QHL_LINK_DIR + "/libqhmath_hvx.a")
@@ -294,16 +362,10 @@ class HexagonExecutor:
         else:
             print(f"Warning: QHMATH library not found at {QHMATH_DIR}")
 
-        hexkl_dir = """{HEXKL_ROOT}/lib/hexagon_toolv19_v{Q6_VERSION}""".format(
-            HEXKL_ROOT=self.config.env_vars["HEXKL_ROOT"],
-            Q6_VERSION=self.config.Q6_VERSION,
+        hexkl_dir = _hexkl_library_dir(
+            self.config.env_vars["HEXKL_ROOT"], self.config.Q6_VERSION
         )
-        if (
-            self.enable_hexkl
-            and os.path.exists(hexkl_dir)
-            and os.path.exists(os.path.join(hexkl_dir, "libhexkl_micro.a"))
-            and os.path.exists(os.path.join(hexkl_dir, "libhexkl_macro.a"))
-        ):
+        if self.enable_hexkl and hexkl_dir:
             hexkl_micro_a = os.path.join(hexkl_dir, "libhexkl_micro.a")
             hexkl_macro_a = os.path.join(hexkl_dir, "libhexkl_macro.a")
             runtime_libs.append(hexkl_micro_a)
@@ -436,6 +498,13 @@ class HexagonExecutor:
         )
         path_to_principal_lib_on_device = paths_to_shared_libs_on_device[0]
 
+        run_main_on_hexagon_debugconfig_local_path = os.path.join(
+            local_dir, "run_main_on_hexagon.debugconfig"
+        )
+        Path(run_main_on_hexagon_debugconfig_local_path).write_text(
+            "rpctimeout=1800000\n", encoding="utf-8"
+        )
+
         if generatePerf:
             if self.alt_perf_path:
                 perf_device_path = self.alt_perf_path
@@ -538,6 +607,24 @@ class HexagonExecutor:
                 ),
                 True,
             ),
+            # Push FastRPC configuration and loader libraries into the standard
+            # CDSP search directory. Some devices do not search the per-run
+            # ADSP_LIBRARY_PATH for these files.
+            (
+                "adb {} -s {} push {} /vendor/lib/rfsa/adsp".format(
+                    self.config.env_vars["ANDROID_HOST"],
+                    self.config.env_vars["ANDROID_SERIAL"],
+                    " ".join(
+                        [
+                            run_main_on_hexagon_debugconfig_local_path,
+                            librun_main_on_hexagon_skel_path,
+                            libcpp_path,
+                            libcppabi_path,
+                        ]
+                    ),
+                ),
+                True,
+            ),
             # Push run_main_on_hexagon binary, input_tensors and all the shared libs
             (
                 "adb {} -s {} push {} {}".format(
@@ -546,6 +633,7 @@ class HexagonExecutor:
                     " ".join(
                         input_tensor_paths
                         + [run_main_on_hexagon_path]
+                        + [run_main_on_hexagon_debugconfig_local_path]
                         + paths_to_shared_libs_local
                     ),
                     self.device_path,
@@ -777,7 +865,8 @@ class HexagonExecutor:
                     self.config.env_vars["HEXAGON_TOOLS"], SIM_Q6SS_PATH
                 )
             ),
-            ("{} -mv{} \
+            (
+                "{} -mv{} \
                 --usefs={}/../Tools/target/hexagon/lib/v{}/G0/pic \
                 --simulated_returnval \
                 --cosim_file {} \
@@ -786,7 +875,8 @@ class HexagonExecutor:
                 {}/rtos/qurt/computev{}/sdksim_bin/runelf.pbn -- \
                 {}/libs/run_main_on_hexagon/ship/hexagon_tool{}_v{}/run_main_on_hexagon_sim \
                 stack_size=0x400000 -- \
-                {}").format(
+                {}"
+            ).format(
                 self.config.HEX_TOOLS["hexagon-sim"],
                 self.config.Q6_VERSION,
                 self.config.env_vars["HEXAGON_TOOLS"],
