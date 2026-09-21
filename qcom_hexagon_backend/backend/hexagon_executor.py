@@ -85,29 +85,17 @@ def _qhmath_hvx_library_dir(hexagon_sdk_root: str, q6_version: str) -> str:
     return os.path.join(hexagon_sdk_root, relative_dir)
 
 
-def _hexkl_library_dir(hexkl_root: str, q6_version: str) -> Optional[str]:
-    """Find the HexKL libraries for a Hexagon architecture version."""
+def _hexkl_library_dir(
+    hexkl_root: str, q6_version: str, sdk_version: Optional[str] = None
+) -> Optional[str]:
+    """Find HexKL libraries matching the selected SDK and architecture versions."""
     lib_root = os.path.join(hexkl_root, "lib")
     tool_dir = f"hexagon_toolv19_v{q6_version}"
-    versioned_roots = []
-    try:
-        versioned_roots = [
-            os.path.join(lib_root, entry)
-            for entry in os.listdir(lib_root)
-            if os.path.isdir(os.path.join(lib_root, entry))
-            and all(part.isdigit() for part in entry.split("."))
-        ]
-    except OSError:
-        pass
-
-    versioned_roots.sort(
-        key=lambda path: tuple(int(part) for part in os.path.basename(path).split(".")),
-        reverse=True,
-    )
-    candidates = [
-        os.path.join(versioned_root, tool_dir) for versioned_root in versioned_roots
-    ]
-    candidates.append(os.path.join(lib_root, tool_dir))
+    if sdk_version:
+        candidates = [os.path.join(lib_root, sdk_version, tool_dir)]
+    else:
+        # Keep supporting the legacy layout when no SDK version is configured.
+        candidates = [os.path.join(lib_root, tool_dir)]
 
     for candidate in candidates:
         if all(
@@ -189,14 +177,23 @@ class HexagonExecutor:
             "HEXAGON_MLIR_ROOT": "HEXAGON_MLIR_ROOT",
             "HEXAGON_SDK_ROOT": "HEXAGON_SDK_ROOT",
             "Q6_VERSION": "HEXAGON_ARCH_VERSION",
+            "HEXAGON_SDK_VERSION": "HEXAGON_SDK_VERSION",
             "HEXKL_ROOT": "HEXKL_ROOT",
         }
         if self.exec_mode == "device":
             env_vars.update(
                 {"ANDROID_HOST": "ANDROID_HOST", "ANDROID_SERIAL": "ANDROID_SERIAL"}
             )
-        # Retrieve environment variables
-        env = {key: get_env_var(val) for key, val in env_vars.items()}
+        # Retrieve environment variables. Older setups may not define the SDK version;
+        # in that case, the HexKL lookup can still use its legacy unversioned layout.
+        env = {
+            key: (
+                get_env_var(val, "")
+                if key == "HEXAGON_SDK_VERSION"
+                else get_env_var(val)
+            )
+            for key, val in env_vars.items()
+        }
         if "ANDROID_HOST" in env and env["ANDROID_HOST"]:
             env["ANDROID_HOST"] = "-H " + env["ANDROID_HOST"]
 
@@ -362,10 +359,35 @@ class HexagonExecutor:
         else:
             print(f"Warning: QHMATH library not found at {QHMATH_DIR}")
 
+        hexkl_sdk_version = self.config.env_vars["HEXAGON_SDK_VERSION"]
         hexkl_dir = _hexkl_library_dir(
-            self.config.env_vars["HEXKL_ROOT"], self.config.Q6_VERSION
+            self.config.env_vars["HEXKL_ROOT"],
+            self.config.Q6_VERSION,
+            hexkl_sdk_version,
         )
-        if self.enable_hexkl and hexkl_dir:
+        if self.enable_hexkl:
+            if hexkl_dir is None:
+                expected_dir = (
+                    os.path.join(
+                        self.config.env_vars["HEXKL_ROOT"],
+                        "lib",
+                        hexkl_sdk_version,
+                        f"hexagon_toolv19_v{self.config.Q6_VERSION}",
+                    )
+                    if hexkl_sdk_version
+                    else os.path.join(
+                        self.config.env_vars["HEXKL_ROOT"],
+                        "lib",
+                        f"hexagon_toolv19_v{self.config.Q6_VERSION}",
+                    )
+                )
+                raise FileNotFoundError(
+                    "HexKL libraries were not found for "
+                    f"HEXAGON_SDK_VERSION={hexkl_sdk_version or '<unset>'!r} "
+                    f"and HEXAGON_ARCH_VERSION={self.config.Q6_VERSION!r}. "
+                    "Expected both libhexkl_micro.a and libhexkl_macro.a in "
+                    f"{expected_dir}."
+                )
             hexkl_micro_a = os.path.join(hexkl_dir, "libhexkl_micro.a")
             hexkl_macro_a = os.path.join(hexkl_dir, "libhexkl_macro.a")
             runtime_libs.append(hexkl_micro_a)
